@@ -20,10 +20,10 @@ const path = require('path');
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
-const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null; // ID-ul tău de Discord
+const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null; // ID-ul tău
 
 // ========== CONFIG ==========
-const STOP_TIMEOUT_MINUTES = 12; // după câte minute fără mesaje se consideră oprit
+const STOP_TIMEOUT_MINUTES = 12;
 const CHECK_INTERVAL_MS = 60 * 1000;
 // ============================
 
@@ -32,8 +32,9 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
-  partials: [Partials.Channel],
+  partials: [Partials.Channel, Partials.Message],
 });
 
 const channelFarmState = new Map();
@@ -50,7 +51,7 @@ app.listen(PORT, () => {
   console.log(`Keep-alive server running on port ${PORT}`);
 });
 
-// ========== PARSER FLEXIBIL ==========
+// ========== PARSER ==========
 function extractFarmData(msg) {
   let text = msg.content || '';
 
@@ -59,9 +60,7 @@ function extractFarmData(msg) {
       const parts = [];
       if (e.title) parts.push(e.title);
       if (e.description) parts.push(e.description);
-      if (e.fields) {
-        e.fields.forEach(f => parts.push(`${f.name}: ${f.value}`));
-      }
+      if (e.fields) e.fields.forEach(f => parts.push(`${f.name}: ${f.value}`));
       if (e.footer?.text) parts.push(e.footer.text);
       return parts.join('\n');
     }).join('\n');
@@ -135,10 +134,8 @@ function formatTime(date) {
   return date.toLocaleString('ro-RO', {
     day: '2-digit',
     month: '2-digit',
-    year: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
-    second: '2-digit',
   });
 }
 
@@ -161,6 +158,63 @@ function groupIntoSessions(farmMessages, gapMinutes = 12) {
   return sessions;
 }
 
+// ========== GRAFIC (QuickChart) ==========
+function generateChartUrl(farmMessages) {
+  if (farmMessages.length < 2) return null;
+
+  // Luăm maxim 30 de puncte ca să nu fie prea aglomerat
+  const step = Math.max(1, Math.floor(farmMessages.length / 30));
+  const points = farmMessages.filter((_, i) => i % step === 0 || i === farmMessages.length - 1);
+
+  const labels = points.map(m => {
+    const d = m.timestamp;
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  });
+
+  const data = points.map(m => m.coins);
+
+  const chartConfig = {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Coins',
+        data,
+        borderColor: '#00ff99',
+        backgroundColor: 'rgba(0, 255, 153, 0.15)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 3,
+      }]
+    },
+    options: {
+      plugins: {
+        title: {
+          display: true,
+          text: 'Progres Farm (Coins)',
+          color: '#ffffff',
+          font: { size: 16 }
+        },
+        legend: { display: false }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#aaaaaa', maxRotation: 45 },
+          grid: { color: 'rgba(255,255,255,0.05)' }
+        },
+        y: {
+          ticks: { color: '#aaaaaa' },
+          grid: { color: 'rgba(255,255,255,0.05)' },
+          beginAtZero: true
+        }
+      }
+    }
+  };
+
+  const encoded = encodeURIComponent(JSON.stringify(chartConfig));
+  return `https://quickchart.io/chart?c=${encoded}&backgroundColor=black&width=700&height=350`;
+}
+
 function buildSummaryEmbed(farmMessages, hours = null) {
   if (farmMessages.length === 0) {
     return new EmbedBuilder()
@@ -169,7 +223,7 @@ function buildSummaryEmbed(farmMessages, hours = null) {
       .setDescription(
         hours
           ? `Nu am găsit mesaje cu coins în ultimele **${hours} ore**.`
-          : 'Nu am găsit mesaje cu coins în istoricul recent.\nÎncearcă `/farm now ore:6` sau `/farm history`.'
+          : 'Nu am găsit mesaje cu coins în istoricul recent.'
       );
   }
 
@@ -182,7 +236,7 @@ function buildSummaryEmbed(farmMessages, hours = null) {
   const minutesPart = durationMin % 60;
   const avgPerHour = Math.round((totalCoins / durationMin) * 60);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(0x00ff99)
     .setTitle('📊 Rezumat Farm')
     .addFields(
@@ -195,6 +249,14 @@ function buildSummaryEmbed(farmMessages, hours = null) {
     )
     .setFooter({ text: hours ? `Filtru: ultimele ${hours} ore` : 'Toate mesajele recente' })
     .setTimestamp();
+
+  // Adăugăm graficul dacă avem destule date
+  const chartUrl = generateChartUrl(farmMessages);
+  if (chartUrl) {
+    embed.setImage(chartUrl);
+  }
+
+  return embed;
 }
 
 function createButtons(hours = null) {
@@ -270,7 +332,7 @@ client.once('clientReady', async () => {
       .setDescription('Tracker de coins / farm')
       .addSubcommand(sub =>
         sub.setName('now')
-          .setDescription('Analizează farm-ul recent')
+          .setDescription('Analizează farm-ul recent + grafic')
           .addIntegerOption(opt =>
             opt.setName('ore')
               .setDescription('Ultimele X ore (opțional)')
@@ -380,7 +442,6 @@ client.on('messageCreate', async (message) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
-  // ===== FARM COMMANDS =====
   if (interaction.isChatInputCommand() && interaction.commandName === 'farm') {
     const sub = interaction.options.getSubcommand();
 
@@ -403,7 +464,7 @@ client.on('interactionCreate', async (interaction) => {
       const sessions = groupIntoSessions(farmMessages).reverse().slice(0, count);
 
       if (sessions.length === 0) {
-        return interaction.editReply({ content: '❌ Nu am găsit nicio sesiune de farm în ultimele zile.' });
+        return interaction.editReply({ content: '❌ Nu am găsit nicio sesiune de farm.' });
       }
 
       const embed = new EmbedBuilder()
@@ -430,14 +491,11 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // ===== CLEAR COMMAND =====
+  // CLEAR
   if (interaction.isChatInputCommand() && interaction.commandName === 'clear') {
     if (!interaction.member.permissions.has('ManageMessages') &&
         !interaction.member.permissions.has('Administrator')) {
-      return interaction.reply({
-        content: '❌ Ai nevoie de permisiunea **Manage Messages**.',
-        ephemeral: true
-      });
+      return interaction.reply({ content: '❌ Ai nevoie de permisiunea **Manage Messages**.', ephemeral: true });
     }
 
     const amount = interaction.options.getInteger('numar');
@@ -473,12 +531,12 @@ client.on('interactionCreate', async (interaction) => {
 
       await interaction.editReply({ content: `✅ Am șters **${deleted}** mesaje.` });
     } catch (err) {
-      console.error('Eroare la clear:', err);
+      console.error(err);
       await interaction.editReply({ content: `❌ Eroare: ${err.message}` });
     }
   }
 
-  // ===== BUTOANE =====
+  // BUTOANE
   if (interaction.isButton()) {
     const [action, type, hoursStr] = interaction.customId.split('_');
     const hours = hoursStr === 'all' ? null : parseInt(hoursStr, 10);
@@ -499,12 +557,9 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply({ content: '❌ Nu există date de exportat.' });
       }
 
-      let filePath;
-      if (type === 'csv') {
-        filePath = await generateCSV(farmMessages);
-      } else {
-        filePath = await generateExcel(farmMessages);
-      }
+      const filePath = type === 'csv'
+        ? await generateCSV(farmMessages)
+        : await generateExcel(farmMessages);
 
       const attachment = new AttachmentBuilder(filePath);
       await interaction.editReply({
@@ -512,14 +567,12 @@ client.on('interactionCreate', async (interaction) => {
         files: [attachment],
       });
 
-      setTimeout(() => {
-        try { fs.unlinkSync(filePath); } catch {}
-      }, 30000);
+      setTimeout(() => { try { fs.unlinkSync(filePath); } catch {} }, 30000);
     }
   }
 });
 
-// ========== NOTIFICARE OPRIRE FARM ==========
+// ========== NOTIFICARE DOAR ÎN DM ==========
 async function checkFarmStops() {
   const now = Date.now();
   const timeoutMs = STOP_TIMEOUT_MINUTES * 60 * 1000;
@@ -529,25 +582,27 @@ async function checkFarmStops() {
 
     if (now - state.lastTimestamp > timeoutMs) {
       try {
-        const mention = NOTIFY_USER_ID ? `<@${NOTIFY_USER_ID}>` : '';
-        const embed = new EmbedBuilder()
-          .setColor(0xff9900)
-          .setTitle('🛑 Farm oprit')
-          .setDescription(
-            `${mention}\nNu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\n\n` +
-            `Ultimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:F> (<t:${Math.floor(state.lastTimestamp / 1000)}:R>)`
-          )
-          .setTimestamp();
+        if (NOTIFY_USER_ID) {
+          const user = await client.users.fetch(NOTIFY_USER_ID);
+          const embed = new EmbedBuilder()
+            .setColor(0xff9900)
+            .setTitle('🛑 Farm oprit')
+            .setDescription(
+              `Nu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\n\n` +
+              `Ultimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:F>\n` +
+              `(<t:${Math.floor(state.lastTimestamp / 1000)}:R>)`
+            )
+            .setTimestamp();
 
-        await state.channel.send({
-          content: mention || undefined,
-          embeds: [embed],
-          allowedMentions: NOTIFY_USER_ID ? { users: [NOTIFY_USER_ID] } : { parse: [] }
-        });
+          await user.send({ embeds: [embed] });
+          console.log(`Notificare DM trimisă către ${user.tag}`);
+        }
 
         state.notified = true;
       } catch (err) {
-        console.error(`Nu am putut notifica pe canalul ${channelId}:`, err.message);
+        console.error('Eroare la trimiterea DM-ului:', err.message);
+        // Dacă nu poate trimite DM (ai închis mesajele private), marchează totuși ca notificat
+        state.notified = true;
       }
     }
   }
@@ -555,7 +610,7 @@ async function checkFarmStops() {
 
 // ========== START ==========
 if (!TOKEN || !CLIENT_ID) {
-  console.error('❌ Lipsește TOKEN sau CLIENT_ID în Environment Variables!');
+  console.error('❌ Lipsește TOKEN sau CLIENT_ID!');
   process.exit(1);
 }
 
