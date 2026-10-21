@@ -22,7 +22,7 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
 
 // ========== CONFIG ==========
-const STOP_TIMEOUT_MINUTES = 10;
+const STOP_TIMEOUT_MINUTES = 12;
 const CHECK_INTERVAL_MS = 60 * 1000;
 // ============================
 
@@ -37,7 +37,7 @@ const client = new Client({
 
 const channelFarmState = new Map();
 
-// ========== KEEP-ALIVE SERVER (pentru Render) ==========
+// ========== KEEP-ALIVE ==========
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -49,43 +49,67 @@ app.listen(PORT, () => {
   console.log(`Keep-alive server running on port ${PORT}`);
 });
 
-// ========== FUNCȚII ==========
-
+// ========== PARSER FLEXIBIL ==========
 function extractFarmData(msg) {
   let text = msg.content || '';
+
   if (msg.embeds?.length > 0) {
-    text = msg.embeds
-      .map((e) => {
-        return [
-          e.title || '',
-          e.description || '',
-          ...(e.fields?.map((f) => `${f.name}: ${f.value}`) || []),
-        ].join('\n');
-      })
-      .join('\n');
+    text += '\n' + msg.embeds.map(e => {
+      const parts = [];
+      if (e.title) parts.push(e.title);
+      if (e.description) parts.push(e.description);
+      if (e.fields) {
+        e.fields.forEach(f => {
+          parts.push(`${f.name}: ${f.value}`);
+        });
+      }
+      if (e.footer?.text) parts.push(e.footer.text);
+      return parts.join('\n');
+    }).join('\n');
   }
 
-  const coinsMatch = text.match(/Coins Collected in 3 Minutes[:\s]*(\d+)/i);
-  if (!coinsMatch) return null;
+  // Căutăm orice variantă de "coins" + număr
+  // Acceptă: "Coins Collected: 50", "Coins Collected in 3 Minutes: 38", "50 coins" etc.
+  const patterns = [
+    /Coins Collected(?: in \d+ Minutes)?[:\s]*(\d+)/i,
+    /Coins[:\s]*(\d+)/i,
+    /(\d+)\s*coins?/i,
+  ];
 
+  let coins = null;
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match) {
+      coins = parseInt(match[1], 10);
+      break;
+    }
+  }
+
+  if (coins === null || isNaN(coins)) return null;
+
+  // Încercăm să extragem și estimated / bag / role dacă există
   const estimatedMatch = text.match(/Estimated Coins per Hour[:\s]*(\d+)/i);
   const bagMatch = text.match(/Bag[:\s]*(.+)/i);
+  const roleMatch = text.match(/(?:Your Role|Role)[:\s]*(\w+)/i);
 
   return {
-    coins: parseInt(coinsMatch[1], 10),
+    coins,
     estimated: estimatedMatch ? parseInt(estimatedMatch[1], 10) : null,
-    bag: bagMatch ? bagMatch[1].trim() : 'Unknown',
+    bag: bagMatch ? bagMatch[1].trim() : (roleMatch ? roleMatch[1] : 'Unknown'),
     timestamp: msg.createdAt,
     id: msg.id,
     url: msg.url,
+    rawText: text.slice(0, 200)
   };
 }
 
+// ========== FETCH ÎMBUNĂTĂȚIT ==========
 async function fetchFarmMessages(channel, hours = null) {
   const limit = 100;
   let allMessages = [];
   let lastId = null;
-  const maxFetch = 1000;
+  const maxFetch = 1500; // mai multe mesaje
+  const cutoff = hours ? Date.now() - (hours * 60 * 60 * 1000) : null;
 
   while (allMessages.length < maxFetch) {
     const options = { limit };
@@ -94,24 +118,25 @@ async function fetchFarmMessages(channel, hours = null) {
     const messages = await channel.messages.fetch(options);
     if (messages.size === 0) break;
 
-    allMessages.push(...messages.values());
+    const batch = [...messages.values()];
+    allMessages.push(...batch);
     lastId = messages.last().id;
 
-    if (hours) {
-      const cutoff = Date.now() - hours * 60 * 60 * 1000;
-      if (messages.last().createdTimestamp < cutoff) break;
+    // Oprim dacă am ajuns înainte de cutoff
+    if (cutoff && messages.last().createdTimestamp < cutoff) {
+      break;
     }
   }
 
   let farmMessages = allMessages
     .map(extractFarmData)
-    .filter((d) => d !== null);
+    .filter(d => d !== null);
 
-  if (hours) {
-    const cutoff = Date.now() - hours * 60 * 60 * 1000;
-    farmMessages = farmMessages.filter((m) => m.timestamp.getTime() >= cutoff);
+  if (cutoff) {
+    farmMessages = farmMessages.filter(m => m.timestamp.getTime() >= cutoff);
   }
 
+  // Sortăm de la cel mai vechi la cel mai nou
   farmMessages.sort((a, b) => a.timestamp - b.timestamp);
   return farmMessages;
 }
@@ -127,6 +152,25 @@ function formatTime(date) {
   });
 }
 
+function groupIntoSessions(farmMessages, gapMinutes = 12) {
+  if (farmMessages.length === 0) return [];
+
+  const sessions = [];
+  let current = [farmMessages[0]];
+
+  for (let i = 1; i < farmMessages.length; i++) {
+    const gap = (farmMessages[i].timestamp - farmMessages[i - 1].timestamp) / 60000;
+    if (gap > gapMinutes) {
+      sessions.push(current);
+      current = [farmMessages[i]];
+    } else {
+      current.push(farmMessages[i]);
+    }
+  }
+  sessions.push(current);
+  return sessions;
+}
+
 function buildSummaryEmbed(farmMessages, hours = null) {
   if (farmMessages.length === 0) {
     return new EmbedBuilder()
@@ -134,8 +178,8 @@ function buildSummaryEmbed(farmMessages, hours = null) {
       .setTitle('❌ Niciun farm găsit')
       .setDescription(
         hours
-          ? `Nu am găsit mesaje de farm în ultimele **${hours} ore**.`
-          : 'Nu am găsit mesaje de farm în istoricul recent.'
+          ? `Nu am găsit mesaje cu coins în ultimele **${hours} ore**.`
+          : 'Nu am găsit mesaje cu coins în istoricul recent.\nÎncearcă `/farm now ore:6` sau `/farm history`.'
       );
   }
 
@@ -143,10 +187,10 @@ function buildSummaryEmbed(farmMessages, hours = null) {
   const end = farmMessages[farmMessages.length - 1];
   const totalCoins = farmMessages.reduce((sum, m) => sum + m.coins, 0);
   const durationMs = end.timestamp - start.timestamp;
-  const durationMin = Math.round(durationMs / 60000);
+  const durationMin = Math.max(1, Math.round(durationMs / 60000));
   const hoursPart = Math.floor(durationMin / 60);
   const minutesPart = durationMin % 60;
-  const avgPerHour = durationMin > 0 ? Math.round((totalCoins / durationMin) * 60) : 0;
+  const avgPerHour = Math.round((totalCoins / durationMin) * 60);
 
   return new EmbedBuilder()
     .setColor(0x00ff99)
@@ -181,10 +225,11 @@ function createButtons(hours = null) {
 }
 
 async function generateCSV(farmMessages) {
-  const header = 'Timestamp,Coins,Estimated per Hour,Bag,Message URL\n';
-  const rows = farmMessages
-    .map(m => `"${formatTime(m.timestamp)}",${m.coins},${m.estimated || ''},"${m.bag}","${m.url}"`)
-    .join('\n');
+  const header = 'Timestamp,Coins,Estimated,Bag/Role,Message URL\n';
+  const rows = farmMessages.map(m =>
+    `"${formatTime(m.timestamp)}",${m.coins},${m.estimated || ''},"${m.bag}","${m.url}"`
+  ).join('\n');
+
   const filePath = path.join(__dirname, `farm_${Date.now()}.csv`);
   fs.writeFileSync(filePath, header + rows, 'utf8');
   return filePath;
@@ -198,7 +243,7 @@ async function generateExcel(farmMessages) {
     { header: 'Timestamp', key: 'timestamp', width: 22 },
     { header: 'Coins', key: 'coins', width: 12 },
     { header: 'Estimated / Hour', key: 'estimated', width: 18 },
-    { header: 'Bag', key: 'bag', width: 15 },
+    { header: 'Bag / Role', key: 'bag', width: 15 },
     { header: 'Message URL', key: 'url', width: 50 },
   ];
 
@@ -213,7 +258,11 @@ async function generateExcel(farmMessages) {
   });
 
   sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F4E79' } };
+  sheet.getRow(1).fill = {
+    type: 'pattern',
+    pattern: 'solid',
+    fgColor: { argb: 'FF1F4E79' },
+  };
 
   const filePath = path.join(__dirname, `farm_${Date.now()}.xlsx`);
   await workbook.xlsx.writeFile(filePath);
@@ -222,18 +271,32 @@ async function generateExcel(farmMessages) {
 
 // ========== EVENTS ==========
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`✅ Bot online ca ${client.user.tag}`);
 
   const commands = [
     new SlashCommandBuilder()
       .setName('farm')
-      .setDescription('Analizează mesajele de farm din canal')
-      .addIntegerOption(opt =>
-        opt.setName('ore')
-          .setDescription('Ultimele X ore (lasă gol pentru tot istoricul recent)')
-          .setMinValue(1)
-          .setMaxValue(168)
+      .setDescription('Tracker de coins / farm')
+      .addSubcommand(sub =>
+        sub.setName('now')
+          .setDescription('Analizează farm-ul recent')
+          .addIntegerOption(opt =>
+            opt.setName('ore')
+              .setDescription('Ultimele X ore (opțional)')
+              .setMinValue(1)
+              .setMaxValue(168)
+          )
+      )
+      .addSubcommand(sub =>
+        sub.setName('history')
+          .setDescription('Arată ultimele sesiuni de farm')
+          .addIntegerOption(opt =>
+            opt.setName('numar')
+              .setDescription('Câte sesiuni (implicit 5)')
+              .setMinValue(1)
+              .setMaxValue(15)
+          )
       )
       .toJSON(),
   ];
@@ -267,31 +330,106 @@ client.on('messageCreate', async (message) => {
     });
   }
 
-  if (message.content.toLowerCase().startsWith('!farm')) {
-    const args = message.content.slice(5).trim();
-    const hours = args ? parseInt(args, 10) : null;
+  // Prefix commands
+  if (!message.content.toLowerCase().startsWith('!farm')) return;
 
-    await message.channel.sendTyping();
-    const farmMessages = await fetchFarmMessages(message.channel, hours);
-    const embed = buildSummaryEmbed(farmMessages, hours);
-    const buttons = createButtons(hours);
+  const args = message.content.slice(5).trim().split(/\s+/);
+  const isHistory = args[0]?.toLowerCase() === 'history';
 
-    await message.reply({ embeds: [embed], components: [buttons] });
+  await message.channel.sendTyping();
+
+  if (isHistory) {
+    const count = parseInt(args[1]) || 5;
+    const farmMessages = await fetchFarmMessages(message.channel, 72);
+    const sessions = groupIntoSessions(farmMessages).reverse().slice(0, count);
+
+    if (sessions.length === 0) {
+      return message.reply('❌ Nu am găsit nicio sesiune de farm.');
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x5865f2)
+      .setTitle(`📜 Istoric Farm (ultimele ${sessions.length} sesiuni)`)
+      .setTimestamp();
+
+    sessions.forEach((session, index) => {
+      const start = session[0];
+      const end = session[session.length - 1];
+      const totalCoins = session.reduce((s, m) => s + m.coins, 0);
+      const durationMin = Math.max(1, Math.round((end.timestamp - start.timestamp) / 60000));
+      const h = Math.floor(durationMin / 60);
+      const m = durationMin % 60;
+
+      embed.addFields({
+        name: `#${index + 1} — ${formatTime(start.timestamp)}`,
+        value: `💰 **${totalCoins.toLocaleString('ro-RO')}** coins • ⏱️ ${h > 0 ? h + 'h ' : ''}${m} min • ${session.length} mesaje`,
+        inline: false
+      });
+    });
+
+    return message.reply({ embeds: [embed] });
   }
+
+  // !farm [ore]
+  const hours = args[0] ? parseInt(args[0], 10) : null;
+  const farmMessages = await fetchFarmMessages(message.channel, hours);
+  const embed = buildSummaryEmbed(farmMessages, hours);
+  const buttons = createButtons(hours);
+
+  await message.reply({ embeds: [embed], components: [buttons] });
 });
 
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'farm') {
-    const hours = interaction.options.getInteger('ore');
-    await interaction.deferReply();
+    const sub = interaction.options.getSubcommand();
 
-    const farmMessages = await fetchFarmMessages(interaction.channel, hours);
-    const embed = buildSummaryEmbed(farmMessages, hours);
-    const buttons = createButtons(hours);
+    if (sub === 'now') {
+      const hours = interaction.options.getInteger('ore');
+      await interaction.deferReply();
 
-    await interaction.editReply({ embeds: [embed], components: [buttons] });
+      const farmMessages = await fetchFarmMessages(interaction.channel, hours);
+      const embed = buildSummaryEmbed(farmMessages, hours);
+      const buttons = createButtons(hours);
+
+      await interaction.editReply({ embeds: [embed], components: [buttons] });
+    }
+
+    if (sub === 'history') {
+      const count = interaction.options.getInteger('numar') || 5;
+      await interaction.deferReply();
+
+      const farmMessages = await fetchFarmMessages(interaction.channel, 72);
+      const sessions = groupIntoSessions(farmMessages).reverse().slice(0, count);
+
+      if (sessions.length === 0) {
+        return interaction.editReply({ content: '❌ Nu am găsit nicio sesiune de farm în ultimele zile.' });
+      }
+
+      const embed = new EmbedBuilder()
+        .setColor(0x5865f2)
+        .setTitle(`📜 Istoric Farm (ultimele ${sessions.length} sesiuni)`)
+        .setTimestamp();
+
+      sessions.forEach((session, index) => {
+        const start = session[0];
+        const end = session[session.length - 1];
+        const totalCoins = session.reduce((s, m) => s + m.coins, 0);
+        const durationMin = Math.max(1, Math.round((end.timestamp - start.timestamp) / 60000));
+        const h = Math.floor(durationMin / 60);
+        const m = durationMin % 60;
+
+        embed.addFields({
+          name: `#${index + 1} — ${formatTime(start.timestamp)}`,
+          value: `💰 **${totalCoins.toLocaleString('ro-RO')}** coins • ⏱️ ${h > 0 ? h + 'h ' : ''}${m} min • ${session.length} mesaje`,
+          inline: false
+        });
+      });
+
+      await interaction.editReply({ embeds: [embed] });
+    }
   }
 
+  // Butoane
   if (interaction.isButton()) {
     const [action, type, hoursStr] = interaction.customId.split('_');
     const hours = hoursStr === 'all' ? null : parseInt(hoursStr, 10);
@@ -345,7 +483,7 @@ async function checkFarmStops() {
           .setColor(0xff9900)
           .setTitle('🛑 Farm oprit')
           .setDescription(
-            `Nu a mai venit niciun mesaj de farm de **${STOP_TIMEOUT_MINUTES} minute**.\nUltimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:R>`
+            `Nu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\nUltimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:R>`
           )
           .setTimestamp();
 
