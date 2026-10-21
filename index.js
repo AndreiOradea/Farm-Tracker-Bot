@@ -708,11 +708,27 @@ async function checkFarmStops() {
     }
   }
 }
-
 // ========== START ==========
-if (!TOKEN || !CLIENT_ID) {
-  console.error('❌ Lipsește TOKEN sau CLIENT_ID!');
+console.log('--- Pornire bot ---');
+console.log('TOKEN există:', !!TOKEN);
+console.log('CLIENT_ID există:', !!CLIENT_ID);
+console.log('NOTIFY_USER_ID există:', !!NOTIFY_USER_ID);
+
+if (!TOKEN) {
+  console.error('❌ TOKEN lipsește din Environment Variables!');
   process.exit(1);
 }
 
-client.login(TOKEN);
+if (!CLIENT_ID) {
+  console.error('❌ CLIENT_ID lipsește din Environment Variables!');
+  process.exit(1);
+}
+
+client.login(TOKEN)
+  .then(() => {
+    console.log('Login initiat cu succes...');
+  })
+  .catch((err) => {
+    console.error('❌ EROARE LA LOGIN:', err.message);
+    console.error(err);
+  });
