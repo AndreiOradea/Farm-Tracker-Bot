@@ -20,9 +20,10 @@ const path = require('path');
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
+const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null; // ID-ul tău de Discord
 
 // ========== CONFIG ==========
-const STOP_TIMEOUT_MINUTES = 12;
+const STOP_TIMEOUT_MINUTES = 12; // după câte minute fără mesaje se consideră oprit
 const CHECK_INTERVAL_MS = 60 * 1000;
 // ============================
 
@@ -59,17 +60,13 @@ function extractFarmData(msg) {
       if (e.title) parts.push(e.title);
       if (e.description) parts.push(e.description);
       if (e.fields) {
-        e.fields.forEach(f => {
-          parts.push(`${f.name}: ${f.value}`);
-        });
+        e.fields.forEach(f => parts.push(`${f.name}: ${f.value}`));
       }
       if (e.footer?.text) parts.push(e.footer.text);
       return parts.join('\n');
     }).join('\n');
   }
 
-  // Căutăm orice variantă de "coins" + număr
-  // Acceptă: "Coins Collected: 50", "Coins Collected in 3 Minutes: 38", "50 coins" etc.
   const patterns = [
     /Coins Collected(?: in \d+ Minutes)?[:\s]*(\d+)/i,
     /Coins[:\s]*(\d+)/i,
@@ -87,7 +84,6 @@ function extractFarmData(msg) {
 
   if (coins === null || isNaN(coins)) return null;
 
-  // Încercăm să extragem și estimated / bag / role dacă există
   const estimatedMatch = text.match(/Estimated Coins per Hour[:\s]*(\d+)/i);
   const bagMatch = text.match(/Bag[:\s]*(.+)/i);
   const roleMatch = text.match(/(?:Your Role|Role)[:\s]*(\w+)/i);
@@ -99,16 +95,15 @@ function extractFarmData(msg) {
     timestamp: msg.createdAt,
     id: msg.id,
     url: msg.url,
-    rawText: text.slice(0, 200)
   };
 }
 
-// ========== FETCH ÎMBUNĂTĂȚIT ==========
+// ========== FETCH ==========
 async function fetchFarmMessages(channel, hours = null) {
   const limit = 100;
   let allMessages = [];
   let lastId = null;
-  const maxFetch = 1500; // mai multe mesaje
+  const maxFetch = 1500;
   const cutoff = hours ? Date.now() - (hours * 60 * 60 * 1000) : null;
 
   while (allMessages.length < maxFetch) {
@@ -118,14 +113,10 @@ async function fetchFarmMessages(channel, hours = null) {
     const messages = await channel.messages.fetch(options);
     if (messages.size === 0) break;
 
-    const batch = [...messages.values()];
-    allMessages.push(...batch);
+    allMessages.push(...messages.values());
     lastId = messages.last().id;
 
-    // Oprim dacă am ajuns înainte de cutoff
-    if (cutoff && messages.last().createdTimestamp < cutoff) {
-      break;
-    }
+    if (cutoff && messages.last().createdTimestamp < cutoff) break;
   }
 
   let farmMessages = allMessages
@@ -136,7 +127,6 @@ async function fetchFarmMessages(channel, hours = null) {
     farmMessages = farmMessages.filter(m => m.timestamp.getTime() >= cutoff);
   }
 
-  // Sortăm de la cel mai vechi la cel mai nou
   farmMessages.sort((a, b) => a.timestamp - b.timestamp);
   return farmMessages;
 }
@@ -299,6 +289,18 @@ client.once('clientReady', async () => {
           )
       )
       .toJSON(),
+
+    new SlashCommandBuilder()
+      .setName('clear')
+      .setDescription('Șterge mesaje din acest canal (doar Admin)')
+      .addIntegerOption(opt =>
+        opt.setName('numar')
+          .setDescription('Câte mesaje să șteargă (maxim 1000)')
+          .setRequired(true)
+          .setMinValue(1)
+          .setMaxValue(1000)
+      )
+      .toJSON(),
   ];
 
   const rest = new REST({ version: '10' }).setToken(TOKEN);
@@ -330,7 +332,6 @@ client.on('messageCreate', async (message) => {
     });
   }
 
-  // Prefix commands
   if (!message.content.toLowerCase().startsWith('!farm')) return;
 
   const args = message.content.slice(5).trim().split(/\s+/);
@@ -370,7 +371,6 @@ client.on('messageCreate', async (message) => {
     return message.reply({ embeds: [embed] });
   }
 
-  // !farm [ore]
   const hours = args[0] ? parseInt(args[0], 10) : null;
   const farmMessages = await fetchFarmMessages(message.channel, hours);
   const embed = buildSummaryEmbed(farmMessages, hours);
@@ -380,6 +380,7 @@ client.on('messageCreate', async (message) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  // ===== FARM COMMANDS =====
   if (interaction.isChatInputCommand() && interaction.commandName === 'farm') {
     const sub = interaction.options.getSubcommand();
 
@@ -429,7 +430,55 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // Butoane
+  // ===== CLEAR COMMAND =====
+  if (interaction.isChatInputCommand() && interaction.commandName === 'clear') {
+    if (!interaction.member.permissions.has('ManageMessages') &&
+        !interaction.member.permissions.has('Administrator')) {
+      return interaction.reply({
+        content: '❌ Ai nevoie de permisiunea **Manage Messages**.',
+        ephemeral: true
+      });
+    }
+
+    const amount = interaction.options.getInteger('numar');
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      let deleted = 0;
+      let lastId = null;
+      const twoWeeksAgo = Date.now() - (14 * 24 * 60 * 60 * 1000);
+
+      while (deleted < amount) {
+        const fetchAmount = Math.min(100, amount - deleted);
+        const options = { limit: fetchAmount };
+        if (lastId) options.before = lastId;
+
+        const messages = await interaction.channel.messages.fetch(options);
+        if (messages.size === 0) break;
+
+        const deletable = messages.filter(m => m.createdTimestamp > twoWeeksAgo);
+        if (deletable.size === 0) break;
+
+        if (deletable.size === 1) {
+          await deletable.first().delete();
+          deleted += 1;
+        } else {
+          const deletedBatch = await interaction.channel.bulkDelete(deletable, true);
+          deleted += deletedBatch.size;
+        }
+
+        lastId = messages.last().id;
+        await new Promise(r => setTimeout(r, 1100));
+      }
+
+      await interaction.editReply({ content: `✅ Am șters **${deleted}** mesaje.` });
+    } catch (err) {
+      console.error('Eroare la clear:', err);
+      await interaction.editReply({ content: `❌ Eroare: ${err.message}` });
+    }
+  }
+
+  // ===== BUTOANE =====
   if (interaction.isButton()) {
     const [action, type, hoursStr] = interaction.customId.split('_');
     const hours = hoursStr === 'all' ? null : parseInt(hoursStr, 10);
@@ -470,6 +519,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
+// ========== NOTIFICARE OPRIRE FARM ==========
 async function checkFarmStops() {
   const now = Date.now();
   const timeoutMs = STOP_TIMEOUT_MINUTES * 60 * 1000;
@@ -479,15 +529,22 @@ async function checkFarmStops() {
 
     if (now - state.lastTimestamp > timeoutMs) {
       try {
+        const mention = NOTIFY_USER_ID ? `<@${NOTIFY_USER_ID}>` : '';
         const embed = new EmbedBuilder()
           .setColor(0xff9900)
           .setTitle('🛑 Farm oprit')
           .setDescription(
-            `Nu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\nUltimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:R>`
+            `${mention}\nNu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\n\n` +
+            `Ultimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:F> (<t:${Math.floor(state.lastTimestamp / 1000)}:R>)`
           )
           .setTimestamp();
 
-        await state.channel.send({ embeds: [embed] });
+        await state.channel.send({
+          content: mention || undefined,
+          embeds: [embed],
+          allowedMentions: NOTIFY_USER_ID ? { users: [NOTIFY_USER_ID] } : { parse: [] }
+        });
+
         state.notified = true;
       } catch (err) {
         console.error(`Nu am putut notifica pe canalul ${channelId}:`, err.message);
