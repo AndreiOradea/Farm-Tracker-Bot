@@ -10,6 +10,7 @@ const {
   ButtonStyle,
   AttachmentBuilder,
   EmbedBuilder,
+  ActivityType,
 } = require('discord.js');
 const ExcelJS = require('exceljs');
 const express = require('express');
@@ -20,10 +21,11 @@ const path = require('path');
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID || null;
-const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null; // ID-ul tău
+const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null;
 
 // ========== CONFIG ==========
 const STOP_TIMEOUT_MINUTES = 12;
+const MIN_SESSION_MINUTES_FOR_DM = 8; // nu trimite DM la sesiuni foarte scurte
 const CHECK_INTERVAL_MS = 60 * 1000;
 // ============================
 
@@ -38,6 +40,7 @@ const client = new Client({
 });
 
 const channelFarmState = new Map();
+let personalBest = { coins: 0, date: null, duration: 0 }; // record personal (in-memory)
 
 // ========== KEEP-ALIVE ==========
 const app = express();
@@ -158,11 +161,10 @@ function groupIntoSessions(farmMessages, gapMinutes = 12) {
   return sessions;
 }
 
-// ========== GRAFIC (QuickChart) ==========
+// ========== GRAFIC ==========
 function generateChartUrl(farmMessages) {
   if (farmMessages.length < 2) return null;
 
-  // Luăm maxim 30 de puncte ca să nu fie prea aglomerat
   const step = Math.max(1, Math.floor(farmMessages.length / 30));
   const points = farmMessages.filter((_, i) => i % step === 0 || i === farmMessages.length - 1);
 
@@ -181,17 +183,17 @@ function generateChartUrl(farmMessages) {
         label: 'Coins',
         data,
         borderColor: '#00ff99',
-        backgroundColor: 'rgba(0, 255, 153, 0.15)',
+        backgroundColor: 'rgba(0, 255, 153, 0.12)',
         fill: true,
         tension: 0.3,
-        pointRadius: 3,
+        pointRadius: 2,
       }]
     },
     options: {
       plugins: {
         title: {
           display: true,
-          text: 'Progres Farm (Coins)',
+          text: 'Progres Farm',
           color: '#ffffff',
           font: { size: 16 }
         },
@@ -212,18 +214,54 @@ function generateChartUrl(farmMessages) {
   };
 
   const encoded = encodeURIComponent(JSON.stringify(chartConfig));
-  return `https://quickchart.io/chart?c=${encoded}&backgroundColor=black&width=700&height=350`;
+  return `https://quickchart.io/chart?c=${encoded}&backgroundColor=#0d1117&width=700&height=340`;
+}
+
+// ========== VERDICT + CULOARE ==========
+function getPerformanceInfo(totalCoins, durationMin, avgPerHour) {
+  let color = 0x00ff99; // verde
+  let verdict = 'Sesiune solidă';
+  let emoji = '🟢';
+
+  if (avgPerHour >= 1200) {
+    color = 0x00ff99;
+    verdict = 'Sesiune excelentă!';
+    emoji = '🟢';
+  } else if (avgPerHour >= 700) {
+    color = 0x00ff99;
+    verdict = 'Sesiune bună';
+    emoji = '🟢';
+  } else if (avgPerHour >= 400) {
+    color = 0xffcc00;
+    verdict = 'Sesiune medie';
+    emoji = '🟡';
+  } else {
+    color = 0xff5555;
+    verdict = 'Sub medie – merită să schimbi locația?';
+    emoji = '🔴';
+  }
+
+  // Actualizăm recordul personal
+  if (totalCoins > personalBest.coins) {
+    personalBest = {
+      coins: totalCoins,
+      date: new Date(),
+      duration: durationMin,
+    };
+  }
+
+  return { color, verdict, emoji };
 }
 
 function buildSummaryEmbed(farmMessages, hours = null) {
   if (farmMessages.length === 0) {
     return new EmbedBuilder()
-      .setColor(0xff0000)
+      .setColor(0xff5555)
       .setTitle('❌ Niciun farm găsit')
       .setDescription(
         hours
           ? `Nu am găsit mesaje cu coins în ultimele **${hours} ore**.`
-          : 'Nu am găsit mesaje cu coins în istoricul recent.'
+          : 'Nu am găsit mesaje cu coins în istoricul recent.\nÎncearcă `/farm now ore:6` sau `/farm history`.'
       );
   }
 
@@ -236,9 +274,12 @@ function buildSummaryEmbed(farmMessages, hours = null) {
   const minutesPart = durationMin % 60;
   const avgPerHour = Math.round((totalCoins / durationMin) * 60);
 
+  const { color, verdict, emoji } = getPerformanceInfo(totalCoins, durationMin, avgPerHour);
+
   const embed = new EmbedBuilder()
-    .setColor(0x00ff99)
-    .setTitle('📊 Rezumat Farm')
+    .setColor(color)
+    .setTitle(`${emoji} Rezumat Farm`)
+    .setDescription(`**${verdict}**`)
     .addFields(
       { name: '🟢 Start', value: formatTime(start.timestamp), inline: true },
       { name: '🔴 Stop', value: formatTime(end.timestamp), inline: true },
@@ -247,14 +288,15 @@ function buildSummaryEmbed(farmMessages, hours = null) {
       { name: '📈 Mesaje', value: `${farmMessages.length}`, inline: true },
       { name: '⚡ Medie / oră', value: `~${avgPerHour.toLocaleString('ro-RO')}`, inline: true }
     )
-    .setFooter({ text: hours ? `Filtru: ultimele ${hours} ore` : 'Toate mesajele recente' })
+    .setFooter({
+      text: personalBest.coins > 0
+        ? `Record personal: ${personalBest.coins.toLocaleString('ro-RO')} coins`
+        : (hours ? `Filtru: ultimele ${hours} ore` : 'Toate mesajele recente')
+    })
     .setTimestamp();
 
-  // Adăugăm graficul dacă avem destule date
   const chartUrl = generateChartUrl(farmMessages);
-  if (chartUrl) {
-    embed.setImage(chartUrl);
-  }
+  if (chartUrl) embed.setImage(chartUrl);
 
   return embed;
 }
@@ -267,11 +309,11 @@ function createButtons(hours = null) {
       .setStyle(ButtonStyle.Primary),
     new ButtonBuilder()
       .setCustomId(`export_csv_${hours || 'all'}`)
-      .setLabel('📄 Export CSV')
+      .setLabel('📄 CSV')
       .setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId(`export_excel_${hours || 'all'}`)
-      .setLabel('📊 Export Excel')
+      .setLabel('📊 Excel')
       .setStyle(ButtonStyle.Success)
   );
 }
@@ -326,6 +368,12 @@ async function generateExcel(farmMessages) {
 client.once('clientReady', async () => {
   console.log(`✅ Bot online ca ${client.user.tag}`);
 
+  // Setăm statusul ca să apară online frumos
+  client.user.setPresence({
+    activities: [{ name: 'farm logs', type: ActivityType.Watching }],
+    status: 'online',
+  });
+
   const commands = [
     new SlashCommandBuilder()
       .setName('farm')
@@ -349,6 +397,10 @@ client.once('clientReady', async () => {
               .setMinValue(1)
               .setMaxValue(15)
           )
+      )
+      .addSubcommand(sub =>
+        sub.setName('status')
+          .setDescription('Vezi dacă rulează un farm acum + record personal')
       )
       .toJSON(),
 
@@ -382,6 +434,14 @@ client.once('clientReady', async () => {
   setInterval(checkFarmStops, CHECK_INTERVAL_MS);
 });
 
+// Păstrăm statusul online
+client.on('shardResume', () => {
+  client.user?.setPresence({
+    activities: [{ name: 'farm logs', type: ActivityType.Watching }],
+    status: 'online',
+  });
+});
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot && !message.webhookId) return;
 
@@ -391,6 +451,7 @@ client.on('messageCreate', async (message) => {
       lastTimestamp: data.timestamp.getTime(),
       notified: false,
       channel: message.channel,
+      startTimestamp: channelFarmState.get(message.channel.id)?.startTimestamp || data.timestamp.getTime(),
     });
   }
 
@@ -398,8 +459,13 @@ client.on('messageCreate', async (message) => {
 
   const args = message.content.slice(5).trim().split(/\s+/);
   const isHistory = args[0]?.toLowerCase() === 'history';
+  const isStatus = args[0]?.toLowerCase() === 'status';
 
   await message.channel.sendTyping();
+
+  if (isStatus) {
+    return handleStatus(message);
+  }
 
   if (isHistory) {
     const count = parseInt(args[1]) || 5;
@@ -440,6 +506,34 @@ client.on('messageCreate', async (message) => {
 
   await message.reply({ embeds: [embed], components: [buttons] });
 });
+
+async function handleStatus(context) {
+  const state = channelFarmState.get(context.channel.id);
+  const now = Date.now();
+
+  let statusText = '🔴 Nu rulează niciun farm în acest canal.';
+  if (state && (now - state.lastTimestamp) < STOP_TIMEOUT_MINUTES * 60 * 1000) {
+    const runningMin = Math.round((now - state.startTimestamp) / 60000);
+    statusText = `🟢 Farm activ de **${runningMin} minute**\nUltimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:R>`;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle('📡 Status Farm')
+    .setDescription(statusText)
+    .addFields({
+      name: '🏆 Record personal',
+      value: personalBest.coins > 0
+        ? `**${personalBest.coins.toLocaleString('ro-RO')}** coins\n${formatTime(personalBest.date)} • ${personalBest.duration} min`
+        : 'Niciun record încă',
+    })
+    .setTimestamp();
+
+  if (context.reply) {
+    return context.reply({ embeds: [embed] });
+  }
+  return context.editReply({ embeds: [embed] });
+}
 
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'farm') {
@@ -488,6 +582,11 @@ client.on('interactionCreate', async (interaction) => {
       });
 
       await interaction.editReply({ embeds: [embed] });
+    }
+
+    if (sub === 'status') {
+      await interaction.deferReply();
+      await handleStatus(interaction);
     }
   }
 
@@ -572,7 +671,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// ========== NOTIFICARE DOAR ÎN DM ==========
+// ========== NOTIFICARE DOAR DM ==========
 async function checkFarmStops() {
   const now = Date.now();
   const timeoutMs = STOP_TIMEOUT_MINUTES * 60 * 1000;
@@ -582,26 +681,28 @@ async function checkFarmStops() {
 
     if (now - state.lastTimestamp > timeoutMs) {
       try {
-        if (NOTIFY_USER_ID) {
+        const sessionMinutes = Math.round((state.lastTimestamp - state.startTimestamp) / 60000);
+
+        // Trimitem DM doar dacă sesiunea a durat destul
+        if (NOTIFY_USER_ID && sessionMinutes >= MIN_SESSION_MINUTES_FOR_DM) {
           const user = await client.users.fetch(NOTIFY_USER_ID);
           const embed = new EmbedBuilder()
             .setColor(0xff9900)
             .setTitle('🛑 Farm oprit')
             .setDescription(
-              `Nu a mai venit niciun mesaj cu coins de **${STOP_TIMEOUT_MINUTES} minute**.\n\n` +
+              `Sesiunea a durat **${sessionMinutes} minute**.\n\n` +
               `Ultimul mesaj: <t:${Math.floor(state.lastTimestamp / 1000)}:F>\n` +
               `(<t:${Math.floor(state.lastTimestamp / 1000)}:R>)`
             )
             .setTimestamp();
 
           await user.send({ embeds: [embed] });
-          console.log(`Notificare DM trimisă către ${user.tag}`);
+          console.log(`DM trimis către ${user.tag}`);
         }
 
         state.notified = true;
       } catch (err) {
-        console.error('Eroare la trimiterea DM-ului:', err.message);
-        // Dacă nu poate trimite DM (ai închis mesajele private), marchează totuși ca notificat
+        console.error('Eroare la DM:', err.message);
         state.notified = true;
       }
     }
