@@ -365,7 +365,7 @@ async function generateExcel(farmMessages) {
 
 // ========== EVENTS ==========
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   console.log(`✅ Bot online ca ${client.user.tag}`);
 
   // Setăm statusul ca să apară online frumos
