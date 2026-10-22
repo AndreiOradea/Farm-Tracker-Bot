@@ -161,11 +161,11 @@ function groupIntoSessions(farmMessages, gapMinutes = 12) {
   return sessions;
 }
 
-// ========== GRAFIC ==========
+// ========== GRAFIC (versiune stabilă) ==========
 function generateChartUrl(farmMessages) {
   if (farmMessages.length < 2) return null;
 
-  const step = Math.max(1, Math.floor(farmMessages.length / 30));
+  const step = Math.max(1, Math.floor(farmMessages.length / 20));
   const points = farmMessages.filter((_, i) => i % step === 0 || i === farmMessages.length - 1);
 
   const labels = points.map(m => {
@@ -180,41 +180,32 @@ function generateChartUrl(farmMessages) {
     data: {
       labels,
       datasets: [{
-        label: 'Coins',
         data,
-        borderColor: '#00ff99',
-        backgroundColor: 'rgba(0, 255, 153, 0.12)',
+        borderColor: 'rgb(0,255,153)',
+        backgroundColor: 'rgba(0,255,153,0.15)',
         fill: true,
         tension: 0.3,
-        pointRadius: 2,
+        pointRadius: 2
       }]
     },
     options: {
       plugins: {
+        legend: { display: false },
         title: {
           display: true,
-          text: 'Progres Farm',
-          color: '#ffffff',
-          font: { size: 16 }
-        },
-        legend: { display: false }
+          text: 'Progres Farm (Coins)',
+          color: '#fff'
+        }
       },
       scales: {
-        x: {
-          ticks: { color: '#aaaaaa', maxRotation: 45 },
-          grid: { color: 'rgba(255,255,255,0.05)' }
-        },
-        y: {
-          ticks: { color: '#aaaaaa' },
-          grid: { color: 'rgba(255,255,255,0.05)' },
-          beginAtZero: true
-        }
+        y: { beginAtZero: true, ticks: { color: '#aaa' } },
+        x: { ticks: { color: '#aaa', maxRotation: 45 } }
       }
     }
   };
 
   const encoded = encodeURIComponent(JSON.stringify(chartConfig));
-  return `https://quickchart.io/chart?c=${encoded}&backgroundColor=#0d1117&width=700&height=340`;
+  return `https://quickchart.io/chart?w=700&h=340&bkg=%230d1117&c=${encoded}`;
 }
 
 // ========== VERDICT + CULOARE ==========
@@ -295,7 +286,9 @@ function buildSummaryEmbed(farmMessages, hours = null) {
     .setTimestamp();
 
   const chartUrl = generateChartUrl(farmMessages);
-  if (chartUrl) embed.setImage(chartUrl);
+  if (chartUrl) {
+    embed.setImage(chartUrl);
+  }
 
   return embed;
 }
