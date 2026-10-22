@@ -25,7 +25,7 @@ const NOTIFY_USER_ID = process.env.NOTIFY_USER_ID || null;
 
 // ========== CONFIG ==========
 const STOP_TIMEOUT_MINUTES = 12;
-const MIN_SESSION_MINUTES_FOR_DM = 8; // nu trimite DM la sesiuni foarte scurte
+const MIN_SESSION_MINUTES_FOR_DM = 8;
 const CHECK_INTERVAL_MS = 60 * 1000;
 // ============================
 
@@ -40,7 +40,7 @@ const client = new Client({
 });
 
 const channelFarmState = new Map();
-let personalBest = { coins: 0, date: null, duration: 0 }; // record personal (in-memory)
+let personalBest = { coins: 0, date: null, duration: 0 };
 
 // ========== KEEP-ALIVE ==========
 const app = express();
@@ -219,7 +219,7 @@ function generateChartUrl(farmMessages) {
 
 // ========== VERDICT + CULOARE ==========
 function getPerformanceInfo(totalCoins, durationMin, avgPerHour) {
-  let color = 0x00ff99; // verde
+  let color = 0x00ff99;
   let verdict = 'Sesiune solidă';
   let emoji = '🟢';
 
@@ -241,7 +241,6 @@ function getPerformanceInfo(totalCoins, durationMin, avgPerHour) {
     emoji = '🔴';
   }
 
-  // Actualizăm recordul personal
   if (totalCoins > personalBest.coins) {
     personalBest = {
       coins: totalCoins,
@@ -365,10 +364,9 @@ async function generateExcel(farmMessages) {
 
 // ========== EVENTS ==========
 
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`✅ Bot online ca ${client.user.tag}`);
 
-  // Setăm statusul ca să apară online frumos
   client.user.setPresence({
     activities: [{ name: 'farm logs', type: ActivityType.Watching }],
     status: 'online',
@@ -407,10 +405,18 @@ client.once('ready', async () => {
     new SlashCommandBuilder()
       .setName('clear')
       .setDescription('Șterge mesaje din acest canal (doar Admin)')
+      .addStringOption(opt =>
+        opt.setName('tip')
+          .setDescription('Ce vrei să ștergi')
+          .setRequired(true)
+          .addChoices(
+            { name: 'Un număr de mesaje', value: 'numar' },
+            { name: 'Tot canalul (ultimele 14 zile)', value: 'all' }
+          )
+      )
       .addIntegerOption(opt =>
         opt.setName('numar')
-          .setDescription('Câte mesaje să șteargă (maxim 1000)')
-          .setRequired(true)
+          .setDescription('Câte mesaje (doar dacă ai ales „Un număr de mesaje”)')
           .setMinValue(1)
           .setMaxValue(1000)
       )
@@ -434,7 +440,6 @@ client.once('ready', async () => {
   setInterval(checkFarmStops, CHECK_INTERVAL_MS);
 });
 
-// Păstrăm statusul online
 client.on('shardResume', () => {
   client.user?.setPresence({
     activities: [{ name: 'farm logs', type: ActivityType.Watching }],
@@ -447,11 +452,12 @@ client.on('messageCreate', async (message) => {
 
   const data = extractFarmData(message);
   if (data) {
+    const existing = channelFarmState.get(message.channel.id);
     channelFarmState.set(message.channel.id, {
       lastTimestamp: data.timestamp.getTime(),
       notified: false,
       channel: message.channel,
-      startTimestamp: channelFarmState.get(message.channel.id)?.startTimestamp || data.timestamp.getTime(),
+      startTimestamp: existing?.startTimestamp || data.timestamp.getTime(),
     });
   }
 
@@ -590,23 +596,36 @@ client.on('interactionCreate', async (interaction) => {
     }
   }
 
-  // CLEAR
+  // ===== CLEAR =====
   if (interaction.isChatInputCommand() && interaction.commandName === 'clear') {
     if (!interaction.member.permissions.has('ManageMessages') &&
         !interaction.member.permissions.has('Administrator')) {
-      return interaction.reply({ content: '❌ Ai nevoie de permisiunea **Manage Messages**.', ephemeral: true });
+      return interaction.reply({
+        content: '❌ Ai nevoie de permisiunea **Manage Messages**.',
+        ephemeral: true
+      });
     }
 
+    const tip = interaction.options.getString('tip');
     const amount = interaction.options.getInteger('numar');
+
+    if (tip === 'numar' && !amount) {
+      return interaction.reply({
+        content: '❌ Trebuie să specifici câte mesaje vrei să ștergi (opțiunea `numar`).',
+        ephemeral: true
+      });
+    }
+
     await interaction.deferReply({ ephemeral: true });
 
     try {
       let deleted = 0;
       let lastId = null;
       const twoWeeksAgo = Date.now() - (14 * 24 * 60 * 60 * 1000);
+      const maxToDelete = tip === 'all' ? 5000 : amount;
 
-      while (deleted < amount) {
-        const fetchAmount = Math.min(100, amount - deleted);
+      while (deleted < maxToDelete) {
+        const fetchAmount = Math.min(100, maxToDelete - deleted);
         const options = { limit: fetchAmount };
         if (lastId) options.before = lastId;
 
@@ -617,7 +636,7 @@ client.on('interactionCreate', async (interaction) => {
         if (deletable.size === 0) break;
 
         if (deletable.size === 1) {
-          await deletable.first().delete();
+          await deletable.first().delete().catch(() => {});
           deleted += 1;
         } else {
           const deletedBatch = await interaction.channel.bulkDelete(deletable, true);
@@ -625,17 +644,21 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         lastId = messages.last().id;
-        await new Promise(r => setTimeout(r, 1100));
+        await new Promise(r => setTimeout(r, 1200));
       }
 
-      await interaction.editReply({ content: `✅ Am șters **${deleted}** mesaje.` });
+      const text = tip === 'all'
+        ? `✅ Am șters **${deleted}** mesaje din canal (doar cele din ultimele 14 zile).`
+        : `✅ Am șters **${deleted}** mesaje.`;
+
+      await interaction.editReply({ content: text });
     } catch (err) {
-      console.error(err);
+      console.error('Eroare la clear:', err);
       await interaction.editReply({ content: `❌ Eroare: ${err.message}` });
     }
   }
 
-  // BUTOANE
+  // ===== BUTOANE =====
   if (interaction.isButton()) {
     const [action, type, hoursStr] = interaction.customId.split('_');
     const hours = hoursStr === 'all' ? null : parseInt(hoursStr, 10);
@@ -681,9 +704,8 @@ async function checkFarmStops() {
 
     if (now - state.lastTimestamp > timeoutMs) {
       try {
-        const sessionMinutes = Math.round((state.lastTimestamp - state.startTimestamp) / 60000);
+        const sessionMinutes = Math.round((state.lastTimestamp - (state.startTimestamp || state.lastTimestamp)) / 60000);
 
-        // Trimitem DM doar dacă sesiunea a durat destul
         if (NOTIFY_USER_ID && sessionMinutes >= MIN_SESSION_MINUTES_FOR_DM) {
           const user = await client.users.fetch(NOTIFY_USER_ID);
           const embed = new EmbedBuilder()
@@ -708,7 +730,8 @@ async function checkFarmStops() {
     }
   }
 }
-// ========== START ==========
+
+// ========== START + LOGGING ==========
 console.log('--- Pornire bot ---');
 console.log('TOKEN există:', !!TOKEN);
 console.log('CLIENT_ID există:', !!CLIENT_ID);
@@ -726,7 +749,7 @@ if (!CLIENT_ID) {
 
 client.login(TOKEN)
   .then(() => {
-    console.log('Login initiat cu succes...');
+    console.log('Login inițiat cu succes...');
   })
   .catch((err) => {
     console.error('❌ EROARE LA LOGIN:', err.message);
